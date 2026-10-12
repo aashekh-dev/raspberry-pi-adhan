@@ -10,14 +10,19 @@ from fastapi.staticfiles import StaticFiles
 import db, scheduler
 from routes import router
 from config import WEB_DIR
+from player import player
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init()
+    await scheduler.wait_for_clock_sync()
     scheduler.start()
-    yield
-    scheduler.shutdown()
+    try:
+        yield
+    finally:
+        scheduler.shutdown()
+        await player.stop()
 
 
 app = FastAPI(title="adhand", lifespan=lifespan)

@@ -162,6 +162,21 @@ function fillSelect(sel, options, selected) {
   });
 }
 
+function fillDeviceSelect(sel, selected) {
+  const outputs = [...state.devices];
+  if (selected && !outputs.some((output) => output.id === selected)) {
+    outputs.push({ id: selected, label: `${selected} (unavailable)` });
+  }
+  fillSelect(sel, outputs, selected);
+}
+
+async function refreshDevices() {
+  state.devices = await api("/devices");
+  document.querySelectorAll('[data-audio-output]').forEach((select) => fillDeviceSelect(select, select.value));
+}
+
+$("#audio-refresh").onclick = () => refreshDevices().catch((e) => alert(e.message));
+
 $("#test-play").onclick = async () => {
   try {
     await api("/test", {
@@ -247,6 +262,9 @@ async function renderPrayers() {
         <label class="grow">After adhan <select class="dua"></select></label>
       </div>
       <div class="row">
+        <label class="grow">Output <select class="device" data-audio-output></select></label>
+      </div>
+      <div class="row">
         <label>Test vol <input type="number" class="testvol" min="0" max="100" value="${p.volume}"></label>
         <button class="sm preview">▶ Preview 10s</button>
         <button class="sm test-reminder">Test reminder</button>
@@ -254,6 +272,8 @@ async function renderPrayers() {
       </div>
     `;
     fillSelect(detail.querySelector(".dua"), ["", ...state.media], p.dua_mp3 ?? "");
+    fillDeviceSelect(detail.querySelector(".device"), p.device);
+    detail.querySelector(".device").onchange = (e) => save({ device: e.target.value || null });
     detail.querySelector(".dua").options[0].textContent = "Nothing";
     detail.querySelector(".offset").onchange = (e) => save({ offset_minutes: Number(e.target.value) });
     detail.querySelector(".reminder").onchange = (e) => save({ reminder_minutes: Number(e.target.value) });
@@ -262,7 +282,8 @@ async function renderPrayers() {
     detail.querySelector(".preview").onclick = () =>
       api("/test", {
         method: "POST",
-        body: JSON.stringify({ mp3: row.querySelector(".mp3").value, volume: testVol(), duration: 10 }),
+        body: JSON.stringify({ mp3: row.querySelector(".mp3").value, volume: testVol(),
+                               device: detail.querySelector(".device").value || null, duration: 10 }),
       }).catch((e) => alert(e.message));
     detail.querySelector(".test-reminder").onclick = () =>
       simulate({ kind: "reminder", name: p.name, volume: testVol() });
@@ -389,7 +410,8 @@ async function setupHookForm() {
 
 async function renderBluetooth() {
   const bt = await api("/bluetooth");
-  $("#bt-unavailable").classList.toggle("hidden", bt.available);
+  $("#bt-unavailable").textContent = bt.error || "Bluetooth pairing is managed on the Pi (bluetoothctl not found here).";
+  $("#bt-unavailable").classList.toggle("hidden", bt.available && !bt.error);
   $("#bt-scan").classList.toggle("hidden", !bt.available);
   const list = $("#bt-list");
   list.innerHTML = "";
@@ -404,7 +426,11 @@ async function renderBluetooth() {
       </span>`;
     const act = (action) =>
       api(`/bluetooth/${action}`, { method: "POST", body: JSON.stringify({ mac: d.mac }) })
-        .then(renderBluetooth).catch((e) => alert(e.message));
+        .then(async () => {
+          await renderBluetooth();
+          await refreshDevices();
+          if (action === "connect") setTimeout(() => refreshDevices().catch(() => {}), 2000);
+        }).catch((e) => alert(e.message));
     card.querySelector(".conn").onclick = () => act(d.connected ? "disconnect" : "connect");
     card.querySelector(".forget").onclick = () => { if (confirm(`Forget ${d.name}?`)) act("forget"); };
     list.appendChild(card);
@@ -424,7 +450,12 @@ $("#bt-scan").onclick = async () => {
       card.innerHTML = `<span>${d.name}</span><button class="sm primary">Pair</button>`;
       card.querySelector("button").onclick = () =>
         api("/bluetooth/pair", { method: "POST", body: JSON.stringify({ mac: d.mac }) })
-          .then(() => { card.remove(); renderBluetooth(); })
+          .then(async () => {
+            card.remove();
+            await renderBluetooth();
+            await refreshDevices();
+            setTimeout(() => refreshDevices().catch(() => {}), 2000);
+          })
           .catch((e) => alert(e.message));
       box.appendChild(card);
     }
@@ -580,7 +611,7 @@ function connectWs() {
   showValue($("#np-volume"));
   [state.media, state.devices] = await Promise.all([api("/media"), api("/devices")]);
   fillSelect($("#test-mp3"), state.media);
-  fillSelect($("#test-device"), state.devices);
+  fillDeviceSelect($("#test-device"));
   await Promise.all([
     refreshStatus(), renderPrayers(), renderPreferences(), renderHooks(),
     setupHookForm(), renderBluetooth(), renderSettings(), renderHealth(), renderEvents(),

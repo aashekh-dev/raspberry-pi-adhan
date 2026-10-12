@@ -3,9 +3,13 @@ computes today's times with the praytimes engine and schedules playback,
 reminder, and suhoor jobs directly. Recomputes just after midnight and
 whenever settings change (via reschedule()).
 """
+import asyncio
+import logging
 import time as time_mod
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
+from apscheduler.events import EVENT_JOB_SUBMITTED
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
@@ -16,10 +20,15 @@ from config import (CHIME_FILE, DEFAULT_ASR_METHOD, DEFAULT_HIGH_LATS,
                     DEFAULT_METHOD, PRAYER_NAMES)
 from events import emit
 from hooks import run_hooks
-from player import player
+from player import PlaybackStopped, player
 from praytimes import PrayTimes
 
 scheduler = AsyncIOScheduler()
+TIMESYNC_DIR = Path("/run/systemd/timesync")
+_clock_sample = None
+_clock_task = None
+_log = logging.getLogger(__name__)
+_dispatched_jobs = set()
 
 _JOB_PREFIXES = ("prayer-", "reminder-", "suhoor", "hook-")
 
@@ -93,15 +102,17 @@ async def play_prayer(name: str, volume_override: int | None = None) -> None:
     try:
         detail = f"Playing {name} adhan ({mp3}, volume {volume}"
         detail += f", {fade}s fade-in)" if fade else ")"
-        await emit("adhan", detail)
         await run_hooks("before", name)
-        await player.play(mp3, volume, prayer["device"], label=name, fade=fade)
-        await player.wait_until_done()
+        playback = await player.play(mp3, volume, prayer["device"], label=name, fade=fade)
+        await emit("adhan", detail)
+        await player.wait_until_done(playback)
         if prayer.get("dua_mp3"):
-            await player.play(prayer["dua_mp3"], volume, prayer["device"], label=f"{name} dua")
-            await player.wait_until_done()
+            playback = await player.play(prayer["dua_mp3"], volume, prayer["device"], label=f"{name} dua")
+            await player.wait_until_done(playback)
         await run_hooks("after", name)
         await emit("adhan", f"Finished {name} adhan")
+    except PlaybackStopped as exc:
+        await emit("skipped", f"{name} adhan interrupted: {exc}")
     except Exception as exc:
         await emit("error", f"{name} adhan failed: {exc}")
 
@@ -114,6 +125,8 @@ async def play_reminder(name: str, volume_override: int | None = None) -> None:
     try:
         await player.play(CHIME_FILE, volume, prayer["device"], label=f"{name} reminder")
         await emit("reminder", f"{name} in {prayer['reminder_minutes']} minutes")
+    except PlaybackStopped as exc:
+        await emit("skipped", f"{name} reminder interrupted: {exc}")
     except Exception as exc:
         await emit("error", f"{name} reminder failed: {exc}")
 
@@ -127,11 +140,27 @@ async def play_suhoor(force: bool = False, volume_override: int | None = None) -
     try:
         await emit("ramadan", f"Suhoor alarm ({mp3})")
         await player.play(mp3, volume, fajr["device"], label="suhoor")
+    except PlaybackStopped as exc:
+        await emit("skipped", f"Suhoor alarm interrupted: {exc}")
     except Exception as exc:
         await emit("error", f"Suhoor alarm failed: {exc}")
 
 
 # ---------- scheduling ----------
+
+def record_dispatch(event) -> None:
+    if event.job_id.startswith(_JOB_PREFIXES):
+        for run_time in event.scheduled_run_times:
+            _dispatched_jobs.add((event.job_id, run_time.astimezone().date()))
+
+
+def _add_playback_job(func, trigger, **options) -> None:
+    key = (options["id"], trigger.run_date.astimezone().date())
+    if key not in _dispatched_jobs:
+        scheduler.add_job(func, trigger, **options)
+
+
+scheduler.add_listener(record_dispatch, EVENT_JOB_SUBMITTED)
 
 def schedule_today() -> dict | None:
     """(Re)create today's jobs for prayers, reminders, and suhoor still in the future."""
@@ -153,20 +182,20 @@ def schedule_today() -> dict | None:
             continue
         run_at = today_at(hhmm)
         if run_at > now:
-            scheduler.add_job(play_prayer, DateTrigger(run_date=run_at),
+            _add_playback_job(play_prayer, DateTrigger(run_date=run_at),
                               args=[name], id=f"prayer-{name}", replace_existing=True)
         reminder = prayer["reminder_minutes"] or 0
         if reminder > 0:
             remind_at = run_at - timedelta(minutes=reminder)
             if remind_at > now:
-                scheduler.add_job(play_reminder, DateTrigger(run_date=remind_at),
+                _add_playback_job(play_reminder, DateTrigger(run_date=remind_at),
                                   args=[name], id=f"reminder-{name}", replace_existing=True)
 
     if hijri.ramadan_active() and db.get_setting("suhoor_enabled"):
         minutes = int(db.get_setting("suhoor_minutes", 45) or 45)
         suhoor_at = today_at(data["times"]["fajr"]) - timedelta(minutes=minutes)
         if suhoor_at > now:
-            scheduler.add_job(play_suhoor, DateTrigger(run_date=suhoor_at),
+            _add_playback_job(play_suhoor, DateTrigger(run_date=suhoor_at),
                               id="suhoor", replace_existing=True)
 
     # offset hooks: independently scheduled at prayer time +/- offset
@@ -179,7 +208,7 @@ def schedule_today() -> dict | None:
         for prayer in hook["prayers"]:
             run_at = today_at(data["times"][prayer]) + timedelta(minutes=offset)
             if run_at > now:
-                scheduler.add_job(run_scheduled_hook, DateTrigger(run_date=run_at),
+                _add_playback_job(run_scheduled_hook, DateTrigger(run_date=run_at),
                                   args=[hook["id"], prayer],
                                   id=f"hook-{hook['id']}-{prayer}", replace_existing=True)
     return data
@@ -194,16 +223,62 @@ async def reschedule(reason: str = "settings changed") -> None:
         await emit("schedule", f"Location not set — nothing scheduled ({reason})")
 
 
-def start() -> None:
+async def wait_for_clock_sync() -> None:
+    """On timesyncd hosts, never build prayer timers from the boot clock."""
+    if TIMESYNC_DIR.is_dir():
+        while not (TIMESYNC_DIR / "synchronized").exists():
+            _log.warning("Waiting for initial system clock synchronization")
+            await asyncio.sleep(5)
+
+
+async def check_clock() -> None:
+    """Compare wall time with monotonic time, independent of APScheduler timers."""
+    global _clock_sample
+    sample = (time_mod.time(), time_mod.monotonic(), date.today())
+    previous = _clock_sample
+    if previous is not None:
+        shift = (sample[0] - previous[0]) - (sample[1] - previous[1])
+        if abs(shift) > 2 or sample[2] != previous[2]:
+            # Replace the cron job too: a backward jump can leave its next run
+            # on the wrong day. Only future playback jobs are rebuilt.
+            _add_daily_job()
+            await reschedule(f"system clock changed ({shift:+.1f}s)")
+    _clock_sample = sample
+
+
+async def _monitor_clock() -> None:
+    while True:
+        await asyncio.sleep(5)
+        try:
+            await check_clock()
+        except Exception:
+            _log.exception("Clock recovery failed; will retry")
+
+
+def _add_daily_job() -> None:
     scheduler.add_job(
         reschedule, CronTrigger(hour=0, minute=5),
         kwargs={"reason": "daily recompute"}, id="daily-recompute",
+        replace_existing=True,
     )
+
+
+def start() -> None:
+    global _clock_sample, _clock_task
+    _dispatched_jobs.clear()
+    _add_daily_job()
     scheduler.start()
     schedule_today()
+    _clock_sample = (time_mod.time(), time_mod.monotonic(), date.today())
+    _clock_task = asyncio.create_task(_monitor_clock())
 
 
 def shutdown() -> None:
+    global _clock_task, _clock_sample
+    if _clock_task is not None:
+        _clock_task.cancel()
+        _clock_task = None
+    _clock_sample = None
     if scheduler.running:
         scheduler.shutdown(wait=False)
 

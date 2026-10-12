@@ -14,6 +14,35 @@ import player
 from config import MEDIA_DIR
 
 
+@pytest.mark.parametrize("device,expected", [
+    ("pulse/bluez_output.AA_BB_CC_DD_EE_FF.1", "pulse/bluez_output.AA_BB_CC_DD_EE_FF.1"),
+    ("pipewire/bluez_output.AA_BB_CC_DD_EE_FF.1", "pipewire/bluez_output.AA_BB_CC_DD_EE_FF.1"),
+    ("alsa/plughw:1,0", "alsa/plughw:1,0"),
+    ("plughw:1,0", "alsa/plughw:1,0"),
+])
+def test_mpv_routes_selected_backend(monkeypatch, device, expected):
+    monkeypatch.setattr(player.shutil, "which", lambda name: name if name == "mpv" else None)
+    cmd, ipc = player._build_cmd(Path("/tmp/test.mp3"), 80, device)
+    assert f"--audio-device={expected}" in cmd
+    assert ipc
+    assert "--really-quiet" not in cmd  # preserve useful playback diagnostics
+
+
+def test_vlc_pulse_routing(monkeypatch):
+    monkeypatch.setattr(player.shutil, "which", lambda name: name if name == "cvlc" else None)
+    cmd, ipc = player._build_cmd(Path("/tmp/test.mp3"), 80, "pulse/jbl")
+    assert cmd[cmd.index("-A") + 1] == "pulse"
+    assert cmd[:2] == ["env", "PULSE_SINK=jbl"]
+    assert "--pulse-audio-device=jbl" not in cmd  # VLC 3 has no such option
+    assert not ipc
+
+
+def test_vlc_rejects_native_pipewire_rather_than_silently_changing_output(monkeypatch):
+    monkeypatch.setattr(player.shutil, "which", lambda name: name if name == "cvlc" else None)
+    with pytest.raises(RuntimeError, match="mpv"):
+        player._build_cmd(Path("/tmp/test.mp3"), 80, "pipewire/jbl")
+
+
 def test_list_media_returns_list():
     media = player.list_media()
     assert isinstance(media, list)

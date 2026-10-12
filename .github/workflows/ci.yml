@@ -21,7 +21,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt -r requirements-dev.txt
 
-      # mpv / cvlc / afplay are intentionally absent on the runner; the player
-      # tests are written to be environment-agnostic so the suite stays green.
+      # Audio tests fake only the OS tools, and exercise playback with Python
+      # child processes; no player or Bluetooth hardware is required.
       - name: Run test suite
         run: pytest -q
+
+      - name: Check installer syntax
+        run: bash -n deploy/install.sh deploy/setup-audio.sh

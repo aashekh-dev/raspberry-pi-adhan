@@ -5,6 +5,27 @@ lifespan runs, so these tests hit a fresh temp database and start/stop the
 real scheduler through the TestClient context manager.
 """
 
+import pytest
+
+
+@pytest.mark.parametrize("error", [
+    "Failed to set power on: org.bluez.Error.Failed",
+    "Failed to start discovery: org.bluez.Error.NotReady",
+    "bluetoothctl --timeout 8 scan on timed out",
+])
+def test_bluetooth_scan_failure_returns_useful_error(client, monkeypatch, error):
+    import bluetooth
+
+    monkeypatch.setattr(bluetooth, "available", lambda: True)
+
+    async def scan():
+        raise RuntimeError(error)
+
+    monkeypatch.setattr(bluetooth, "scan", scan)
+    response = client.post("/api/bluetooth/scan")
+    assert response.status_code == 400
+    assert error in response.json()["detail"]
+
 
 def test_status_ok_and_keys(client):
     r = client.get("/api/status")
@@ -150,3 +171,38 @@ def test_events_endpoint(client):
     r = client.get("/api/events")
     assert r.status_code == 200
     assert isinstance(r.json(), list)
+
+
+def test_playback_readiness_error_is_actionable(client, monkeypatch):
+    import routes
+    async def play(*args, **kwargs):
+        raise RuntimeError("Audio output pulse/jbl unavailable")
+    monkeypatch.setattr(routes.player, "play", play)
+    response = client.post("/api/test", json={"mp3": "test.mp3", "device": "pulse/jbl"})
+    assert response.status_code == 503
+    assert "pulse/jbl unavailable" in response.json()["detail"]
+
+
+def test_saved_output_can_be_reset_to_system_default(client):
+    selected = client.put("/api/prayers/fajr", json={"device": "pulse/bluez_output.AA_BB_CC_DD_EE_FF.1"})
+    assert selected.json()["device"] == "pulse/bluez_output.AA_BB_CC_DD_EE_FF.1"
+    cleared = client.put("/api/prayers/fajr", json={"device": None})
+    assert cleared.status_code == 200
+    assert cleared.json()["device"] is None
+
+
+def test_other_prayer_edits_preserve_saved_output(client):
+    client.put("/api/prayers/fajr", json={"device": "pulse/jbl"})
+    updated = client.put("/api/prayers/fajr", json={"volume": 60})
+    assert updated.json()["device"] == "pulse/jbl"
+
+
+def test_stopped_test_playback_is_not_a_server_failure(client, monkeypatch):
+    import routes
+    from player import PlaybackStopped
+    async def play(*args, **kwargs):
+        raise PlaybackStopped("Playback interrupted during audio recovery")
+    monkeypatch.setattr(routes.player, "play", play)
+    response = client.post("/api/test", json={"mp3": "test.mp3"})
+    assert response.status_code == 200
+    assert response.json() == {"playing": None, "interrupted": True}

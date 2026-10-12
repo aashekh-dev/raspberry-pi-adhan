@@ -54,7 +54,8 @@
       <h2>Test adhan</h2>
       <div class="row">
         <select id="test-mp3"></select>
-        <select id="test-device"></select>
+        <select id="test-device" data-audio-output aria-label="Test audio output"></select>
+        <button id="audio-refresh" class="sm">Refresh outputs</button>
       </div>
       <div class="row">
         <label>Volume <input type="range" id="test-volume" min="0" max="100" value="80"></label>
@@ -142,6 +143,7 @@
 
     <section>
       <h2>Bluetooth speakers</h2>
+      <p class="meta">Pair and connect your speaker here, then choose its output in Test adhan or each prayer's options.</p>
       <div id="bt-unavailable" class="meta hidden">Bluetooth pairing is managed on the Pi (bluetoothctl not found here).</div>
       <div id="bt-list"></div>
       <div class="row">

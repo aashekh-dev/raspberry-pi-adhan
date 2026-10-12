@@ -22,7 +22,7 @@ from config import (ASR_METHODS, CALC_METHODS, DB_PATH, DEFAULT_ASR_METHOD,
                     DEFAULT_HIGH_LATS, DEFAULT_METHOD, HIGH_LAT_RULES,
                     MAX_UPLOAD_MB, MEDIA_DIR, PRAYER_NAMES, PREFERENCE_DEFAULTS)
 from events import emit, ws_manager
-from player import list_media, player
+from player import PlaybackStopped, list_media, player
 
 router = APIRouter()
 
@@ -147,6 +147,8 @@ async def put_prayer(name: str, p: PrayerUpdate):
     if name not in PRAYER_NAMES:
         raise HTTPException(404, f"unknown prayer: {name}")
     fields = p.model_dump(exclude_none=True)
+    if "device" in p.model_fields_set and not p.device:
+        fields["device"] = None  # explicit selection of the system default
     if p.dua_mp3 == "":  # explicit clear
         fields["dua_mp3"] = None
     for key in ("mp3", "dua_mp3"):
@@ -242,8 +244,14 @@ async def test_play(req: TestRequest):
     label = "preview" if req.duration else "test"
     try:
         await player.play(req.mp3, req.volume, req.device, label=label, duration=req.duration)
+    except PlaybackStopped:
+        return {"playing": player.current, "interrupted": True}
     except FileNotFoundError as exc:
         raise HTTPException(400, str(exc))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc))
     if not req.duration:
         await emit("test", f"Test playback: {req.mp3} at volume {req.volume}")
     return {"playing": player.current}
@@ -397,7 +405,10 @@ async def bt_status():
 async def bt_scan():
     if not bluetooth.available():
         raise HTTPException(400, "bluetoothctl not available on this machine")
-    return await bluetooth.scan()
+    try:
+        return await bluetooth.scan()
+    except RuntimeError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @router.post("/bluetooth/{action}")

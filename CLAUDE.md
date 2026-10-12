@@ -14,7 +14,7 @@ a LAN-only daemon + web app so family members can control it from their phones.
   - `scheduler.py` — APScheduler in-process jobs replace crontab rewriting.
     Recomputes daily at 00:05 and on any settings change. Prayer times computed
     locally by the legacy `praytimes.py` at the repo root.
-  - `player.py` — playback via cvlc (Pi), mpv/afplay fallbacks (dev). Volume is
+  - `player.py` — playback prefers mpv, with cvlc/afplay fallbacks. Volume is
     0–100 (50 = vlc unity gain); legacy used millibels.
   - `hooks.py` — hooks are DB rules (position before/after, prayers, days-of-week
     0=Mon..6=Sun, enabled) that reference scripts by filename from the legacy
@@ -56,6 +56,17 @@ a LAN-only daemon + web app so family members can control it from their phones.
   fade gracefully. install.sh now apt-installs mpv + bluez.
 - **Bluetooth** (`bluetooth.py`) wraps bluetoothctl; `available()` false on dev
   Macs and the UI shows a hint instead.
+- **Audio routing** (`audio.py`) enumerates `pulse/` sinks via pactl, falls back
+  to native `pipewire/` names via pw-dump, and keeps stored raw ALSA IDs working.
+  Pairing stays separate from selecting an output. Player readiness checks can
+  reconnect a saved Bluetooth sink with finite backoff, and Stop cancels recovery.
+  Per-prayer options now expose output selection; offline saved choices stay
+  visible. Nonzero playback exits retain diagnostics and stop the prayer sequence.
+- **Headless installation** uses the real invoking account (including SUDO_USER),
+  enables user lingering/audio services, installs A2DP plugins, and selects the
+  WirePlumber 0.4 Lua or 0.5+ config. deploy/adhand.service is now a template
+  rendered by deploy/render_service.py; UID/home/runtime/session values are not
+  hardcoded. deploy/setup-audio.sh can repair audio config independently.
 - **Self-update** (`system.py`): git pull --ff-only + pip install, then
   os._exit(0) — relies on systemd Restart=always. No sudo needed.
 - **Hook timing/volume** (2026-07): hooks have `offset_minutes` (-120..120;

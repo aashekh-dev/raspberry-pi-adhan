@@ -4,7 +4,9 @@ import re
 import shutil
 
 _DEVICE_RE = re.compile(r"^Device ([0-9A-F:]{17}) (.+)$", re.MULTILINE | re.IGNORECASE)
-_MAC_RE = re.compile(r"^[0-9A-F:]{17}$", re.IGNORECASE)
+_MAC_RE = re.compile(r"^(?:[0-9A-F]{2}:){5}[0-9A-F]{2}$", re.IGNORECASE)
+_FAILURE_RE = re.compile(r"^(?:Failed\b|Invalid command\b|No default controller\b|Device .* not available)",
+                         re.MULTILINE | re.IGNORECASE)
 
 
 def available() -> bool:
@@ -12,16 +14,25 @@ def available() -> bool:
 
 
 async def _run(*args: str, timeout: int = 20) -> str:
-    proc = await asyncio.create_subprocess_exec(
-        "bluetoothctl", *args,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "bluetoothctl", *args,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        )
+    except OSError as exc:
+        raise RuntimeError(f"Cannot run bluetoothctl: {exc}") from exc
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
+    except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
         proc.kill()
+        await proc.communicate()
+        if isinstance(exc, asyncio.CancelledError):
+            raise
         raise RuntimeError(f"bluetoothctl {' '.join(args)} timed out")
-    return out.decode(errors="replace")
+    output = re.sub(r"\x1b\[[0-9;]*m", "", out.decode(errors="replace"))
+    if proc.returncode != 0 or _FAILURE_RE.search(output):
+        raise RuntimeError(f"bluetoothctl {' '.join(args)} failed (exit {proc.returncode}): {output.strip()[-1000:]}")
+    return output
 
 
 def _parse_devices(output: str) -> list[dict]:
@@ -40,10 +51,14 @@ async def status() -> dict:
     if not available():
         return {"available": False, "devices": []}
     # "devices Paired" on bluez >= 5.65, "paired-devices" before
-    out = await _run("devices", "Paired", timeout=10)
+    try:
+        out = await _run("devices", "Paired", timeout=10)
+    except RuntimeError:
+        try:
+            out = await _run("paired-devices", timeout=10)
+        except RuntimeError as exc:
+            return {"available": True, "devices": [], "error": str(exc)}
     devices = _parse_devices(out)
-    if not devices:
-        devices = _parse_devices(await _run("paired-devices", timeout=10))
     connected = await _connected_macs()
     for d in devices:
         d["connected"] = d["mac"] in connected
@@ -52,6 +67,7 @@ async def status() -> dict:
 
 async def scan(seconds: int = 8) -> list[dict]:
     """Scan for nearby devices; returns unpaired discoveries."""
+    await _run("power", "on", timeout=10)
     await _run("--timeout", str(seconds), "scan", "on", timeout=seconds + 10)
     found = _parse_devices(await _run("devices", timeout=10))
     paired = {d["mac"] for d in (await status())["devices"]}
@@ -74,6 +90,18 @@ async def pair(mac: str) -> str:
 
 async def connect(mac: str) -> str:
     return await _run("connect", _check_mac(mac), timeout=20)
+
+
+async def reconnect(mac: str) -> str:
+    """Reconnect an already paired speaker; do not pair or change routing."""
+    mac = _check_mac(mac)
+    for attempt in range(3):
+        try:
+            return await connect(mac)
+        except RuntimeError as exc:
+            if attempt == 2:
+                raise RuntimeError(f"Bluetooth {mac} unavailable after 3 attempts: {exc}") from exc
+            await asyncio.sleep(2 ** attempt)
 
 
 async def disconnect(mac: str) -> str:
