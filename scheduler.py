@@ -50,9 +50,12 @@ def compute_times(day: date | None = None) -> dict | None:
     if lat is None or lng is None:
         return None
     day = day or date.today()
-    utc_offset = -(time_mod.timezone / 3600)
-    is_dst = time_mod.localtime().tm_isdst
-    t = _engine().getTimes((day.year, day.month, day.day), (lat, lng), utc_offset, is_dst)
+    # Resolve the requested day's offset after the overnight DST transition.
+    # Using the current DST flag at 00:05 leaves transition-day prayers an
+    # hour off. This offset already includes DST; do not add it a second time.
+    local_noon = datetime(day.year, day.month, day.day, 12).astimezone()
+    utc_offset = local_noon.utcoffset().total_seconds() / 3600
+    t = _engine().getTimes((day.year, day.month, day.day), (lat, lng), utc_offset)
     return {
         "times": {name: t[name] for name in PRAYER_NAMES},
         "extras": {name: t[name] for name in ("imsak", "sunrise", "midnight")},
@@ -234,15 +237,16 @@ async def wait_for_clock_sync() -> None:
 async def check_clock() -> None:
     """Compare wall time with monotonic time, independent of APScheduler timers."""
     global _clock_sample
-    sample = (time_mod.time(), time_mod.monotonic(), date.today())
+    sample = (time_mod.time(), time_mod.monotonic(), date.today(),
+              datetime.now().astimezone().utcoffset())
     previous = _clock_sample
     if previous is not None:
         shift = (sample[0] - previous[0]) - (sample[1] - previous[1])
-        if abs(shift) > 2 or sample[2] != previous[2]:
+        if abs(shift) > 2 or sample[2] != previous[2] or sample[3] != previous[3]:
             # Replace the cron job too: a backward jump can leave its next run
             # on the wrong day. Only future playback jobs are rebuilt.
             _add_daily_job()
-            await reschedule(f"system clock changed ({shift:+.1f}s)")
+            await reschedule(f"system clock or UTC offset changed ({shift:+.1f}s)")
     _clock_sample = sample
 
 
@@ -269,7 +273,8 @@ def start() -> None:
     _add_daily_job()
     scheduler.start()
     schedule_today()
-    _clock_sample = (time_mod.time(), time_mod.monotonic(), date.today())
+    _clock_sample = (time_mod.time(), time_mod.monotonic(), date.today(),
+                     datetime.now().astimezone().utcoffset())
     _clock_task = asyncio.create_task(_monitor_clock())
 
 
